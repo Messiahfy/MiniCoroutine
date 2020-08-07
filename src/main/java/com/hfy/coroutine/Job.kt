@@ -5,6 +5,7 @@ import kotlin.coroutines.CoroutineContext
 
 typealias OnComplete = () -> Unit
 
+typealias CancellationException = java.util.concurrent.CancellationException
 typealias OnCancel = () -> Unit
 
 interface Job : CoroutineContext.Element {

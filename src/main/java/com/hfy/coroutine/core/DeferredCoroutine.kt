@@ -1,8 +1,11 @@
 package com.hfy.coroutine.core
 
+import com.hfy.coroutine.CancellationException
 import com.hfy.coroutine.Deferred
+import com.hfy.coroutine.Job
+import com.hfy.coroutine.cancel.suspendCancellableCoroutine
 import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.suspendCoroutine
+import kotlin.coroutines.coroutineContext
 
 class DeferredCoroutine<T>(context: CoroutineContext) : AbstractCoroutine<T>(context), Deferred<T> {
     override suspend fun await(): T {
@@ -11,14 +14,19 @@ class DeferredCoroutine<T>(context: CoroutineContext) : AbstractCoroutine<T>(con
             is CoroutineState.Cancelling,
             is CoroutineState.InComplete -> awaitSuspend()
             is CoroutineState.Complete<*> -> {
-                currentState.exception?.let { throw  it } ?: (currentState.value as T)
+                coroutineContext[Job]?.isActive?.takeIf { !it }?.let {
+                    throw CancellationException("Coroutine is cancelled.")
+                }
+                currentState.exception?.let { throw it } ?: (currentState.value as T)
             }
         }
     }
 
-    private suspend fun awaitSuspend() = suspendCoroutine<T> { continuation ->
-        doOnCompleted { result ->
+    private suspend fun awaitSuspend() = suspendCancellableCoroutine<T> { continuation ->
+        val disposable = doOnCompleted { result ->
             continuation.resumeWith(result)
         }
+        continuation.invokeOnCancellation { disposable.dispose() }
+        //取消时，CancellableContinuation内部会调用resumeWithException(CancellationException("string"))
     }
 }
