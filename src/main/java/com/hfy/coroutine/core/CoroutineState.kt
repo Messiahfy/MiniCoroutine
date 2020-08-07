@@ -29,6 +29,12 @@ sealed class CoroutineState {
         }
     }
 
+    fun notifyCancellation() {
+        this.disposableList.loopOn<CancellationHandlerDisposable> {
+            it.onCancel()
+        }
+    }
+
     fun clear() {
         this.disposableList = RecursiveList.Nil
     }
