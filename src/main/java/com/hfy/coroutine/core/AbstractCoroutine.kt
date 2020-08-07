@@ -51,6 +51,9 @@ abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuati
         //协程恢复时，即执行完成，此时回调完成
         newState.notifyCompletion(result)
         newState.clear()
+
+        //处理异常
+        (newState as CoroutineState.Complete<T>).exception?.let(this::tryHandleException)
     }
 
     override suspend fun join() {
@@ -178,4 +181,20 @@ abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuati
             }
         }
     }
+
+    /**
+     * 区别处理取消异常和其他异常
+     */
+    private fun tryHandleException(e: Throwable): Boolean {
+        return when (e) {
+            is CancellationException -> {
+                false
+            }
+            else -> {
+                handleJobException(e)
+            }
+        }
+    }
+
+    protected open fun handleJobException(e: Throwable) = false
 }

@@ -17,6 +17,7 @@ class DeferredCoroutine<T>(context: CoroutineContext) : AbstractCoroutine<T>(con
                 coroutineContext[Job]?.isActive?.takeIf { !it }?.let {
                     throw CancellationException("Coroutine is cancelled.")
                 }
+                //AbstractCoroutine的resumeWith中会设置异常数据，这里取出有异常则抛出
                 currentState.exception?.let { throw it } ?: (currentState.value as T)
             }
         }
