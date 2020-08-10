@@ -5,6 +5,7 @@ import com.hfy.coroutine.Job
 import com.hfy.coroutine.OnCancel
 import com.hfy.coroutine.OnComplete
 import com.hfy.coroutine.cancel.suspendCancellableCoroutine
+import com.hfy.coroutine.scope.CoroutineScope
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.*
 
@@ -12,16 +13,36 @@ import kotlin.coroutines.*
  * 为了监听协程完成的事件而作为completion参数在启动时传入，
  * 同时作为Job的实现自身也被添加到协程上下文中，方便协程体内部以及其他逻辑获取。
  */
-abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuation<T> {
+abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuation<T>, CoroutineScope {
 
     protected val state = AtomicReference<CoroutineState>()
 
     override val context: CoroutineContext
 
+    override val scopeContext: CoroutineContext
+        get() = context
+
+    /**
+     * parentJob为传入的context中的Job
+     *
+     * 以launch函数为例，内部会创建AbstractCoroutine的子类，构造函数传入的context为作用域的context
+     * 加上自行传入的context，所以parentJob就是从作用域的context和自行传入的context中取出，是否
+     * 为空取决于我们是否设置。而协程中再使用launch启动子协程，构造函数同样传入context，此时作用域来自
+     * 父协程，所以此时context会加上父协程的scope，也就是startCoroutine函数的receiver参数，可以看出，
+     * 由于AbstractCoroutine是一个Job子类，所以子协程必然能得到parentJob。协程间可以形成一个树状结构，
+     * 孙协程的parentJob为子协程，子协程的parentJob为父协程。
+     */
+    protected val parentJob = context[Job]
+
+    private var parentCancelDisposable: Disposable? = null
 
     init {
         state.set(CoroutineState.InComplete())
         this.context = context + this
+
+        //parentJob为父协程，如果父协程不存在，则当前协程处于顶级作用域，
+        //如果父协程存在，那么就注册它的取消监听，在父协程取消时，子协程也取消
+        parentCancelDisposable = parentJob?.attachChild(this)
     }
 
     val isCompleted
@@ -31,6 +52,7 @@ abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuati
         get() = when (val currentState = state.get()) {
             is CoroutineState.Complete<*>,
             is CoroutineState.Cancelling -> false
+            is CoroutineState.CompleteWaitForChildren<*> -> !currentState.isCancelling
             is CoroutineState.InComplete -> true
         }
 
@@ -39,26 +61,67 @@ abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuati
             when (prevState) {
                 //although cancelled, flows of job may work out with the normal result.
                 is CoroutineState.Cancelling,
-                is CoroutineState.InComplete -> {
-                    CoroutineState.Complete(result.getOrNull(), result.exceptionOrNull()).from(prevState)
-                }
+                is CoroutineState.InComplete -> prevState.tryComplete(result)
+                is CoroutineState.CompleteWaitForChildren<*>,
                 is CoroutineState.Complete<*> -> {
                     throw IllegalStateException("Already completed!")
                 }
             }
         }
 
-        //协程恢复时，即执行完成，此时回调完成
-        newState.notifyCompletion(result)
-        newState.clear()
+        when (newState) {
+            //如果需要等待子协程完成，则调用CompleteWaitForChildren的tryWaitForChildren，
+            //子协程完成时回调tryCompleteOnChildCompleted
+            is CoroutineState.CompleteWaitForChildren<*> -> newState.tryWaitForChildren(::tryCompleteOnChildCompleted)
+            //如果没有子协程，直接执行完成
+            is CoroutineState.Complete<*> -> makeCompletion(newState as CoroutineState.Complete<T>)
+        }
+    }
+
+    /**
+     * 子协程完成时的回调
+     */
+    private fun tryCompleteOnChildCompleted(child: Job) {
+        val newState = state.updateAndGet { prev ->
+            when (prev) {
+                is CoroutineState.Cancelling,
+                is CoroutineState.InComplete -> {
+                    throw IllegalStateException("Should be waiting for children!")
+                }
+                is CoroutineState.CompleteWaitForChildren<*> -> {
+                    prev.onChildCompleted(child)
+                }
+                is CoroutineState.Complete<*> -> throw IllegalStateException("Already completed!")
+            }
+        }
+
+        //全部子协程执行完毕
+        (newState as? CoroutineState.Complete<T>)?.let {
+            makeCompletion(it)
+        }
+    }
+
+    private fun makeCompletion(newState: CoroutineState.Complete<T>) {
+        val result = if (newState.exception == null) {
+            Result.success(newState.value)
+        } else {
+            Result.failure<T>(newState.exception)
+        }
 
         //处理异常
-        (newState as CoroutineState.Complete<T>).exception?.let(this::tryHandleException)
+        result.exceptionOrNull()?.let(this::tryHandleException)
+
+        //通知完成回调
+        newState.notifyCompletion(result)
+        newState.clear()
+        parentCancelDisposable?.dispose()
     }
+
 
     override suspend fun join() {
         when (state.get()) {
             is CoroutineState.InComplete,
+            is CoroutineState.CompleteWaitForChildren<*>,
             is CoroutineState.Cancelling -> return joinSuspend()
             is CoroutineState.Complete<*> -> {
                 val currentCallingJobState = coroutineContext[Job]?.isActive ?: return
@@ -95,14 +158,17 @@ abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuati
                 //如果取消中或已完成，则无作用
                 is CoroutineState.Cancelling,
                 is CoroutineState.Complete<*> -> prev
+                is CoroutineState.CompleteWaitForChildren<*> -> {
+                    prev.copy(isCancelling = true)
+                }
             }
         }
 
         //如果旧状态是未完成，那么说明改为了取消中，此时回调取消
         if (prevState is CoroutineState.InComplete) {
             prevState.notifyCancellation()
-            prevState.clear()
         }
+        parentCancelDisposable?.dispose()
     }
 
     /**
@@ -123,6 +189,7 @@ abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuati
                 is CoroutineState.Complete<*> -> {
                     prev
                 }
+                is CoroutineState.CompleteWaitForChildren<*> -> prev.copy().with(disposable)
             }
         }
 
@@ -153,6 +220,7 @@ abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuati
                 is CoroutineState.Complete<*> -> {
                     prev
                 }
+                is CoroutineState.CompleteWaitForChildren<*> -> prev.copy().with(disposable)
             }
         }
         (newState as? CoroutineState.Cancelling)?.let {
@@ -178,6 +246,7 @@ abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuati
                 is CoroutineState.Complete<*> -> {
                     prev
                 }
+                is CoroutineState.CompleteWaitForChildren<*> -> prev.copy().without(disposable)
             }
         }
     }
@@ -191,10 +260,42 @@ abstract class AbstractCoroutine<T>(context: CoroutineContext) : Job, Continuati
                 false
             }
             else -> {
-                handleJobException(e)
+                //如果父协程仍然不是根协程，则异常继续向上传播
+                (parentJob as? AbstractCoroutine<*>)?.handleChildException(e)?.takeIf { it }
+                    ?: handleJobException(e)
             }
         }
     }
 
+    /**
+     * 由子协程调用，因为要设计为子协程遇到未捕获的异常要优先向上传播，如果没有父协程才自行处理
+     */
+    protected open fun handleChildException(e: Throwable): Boolean {
+        cancel()
+        return tryHandleException(e)
+    }
+
     protected open fun handleJobException(e: Throwable) = false
+
+    /**
+     * 父协程关联子协程
+     */
+    override fun attachChild(child: Job): Disposable {
+        state.updateAndGet { prev ->
+            when (prev) {
+                is CoroutineState.InComplete -> {
+                    CoroutineState.InComplete().from(prev).with(child)
+                }
+                is CoroutineState.Cancelling -> {
+                    CoroutineState.Cancelling().from(prev).with(child)
+                }
+                is CoroutineState.CompleteWaitForChildren<*> -> prev.copy().with(child)
+                is CoroutineState.Complete<*> -> throw IllegalStateException("Parent already completed.")
+            }
+        }
+
+        return invokeOnCancel {
+            child.cancel()
+        }
+    }
 }
